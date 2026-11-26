@@ -692,6 +692,97 @@ class ScheduledJobRegistry(BaseRegistry):
         jobs_to_schedule = self.connection.zrangebyscore(self.key, 0, score, start=0, num=chunk_size)
         return [as_text(job_id) for job_id in jobs_to_schedule]
 
+    def enqueue_jobs(self, job_ids: list[str], queue: Queue, timestamp: float | None = None) -> list[Job]:
+        """Move due jobs from this registry onto their queue, re-validating each job at transfer time.
+
+        A batch read from ``get_jobs_to_schedule()`` can be stale by the time it is acted on:
+        another scheduler may have transferred the same job, or the operator may have canceled,
+        rescheduled or deleted it in between. To make every decision reflect the state valid at
+        the moment of transfer, each job is claimed with optimistic locking (WATCH/MULTI/EXEC):
+
+          - if the job no longer exists, drop the stale registry entry;
+          - if the job's status is no longer SCHEDULED (e.g. it was canceled, or another
+            scheduler already enqueued it), drop the stale entry without enqueuing;
+          - if the job was rescheduled and its score is now in the future, leave both the
+            registry entry and the job untouched until the new time arrives;
+          - otherwise remove it from the registry and enqueue it atomically. Normal and
+            rate-limited jobs go through their regular enqueue paths, preserving the
+            at-front option, rate limit slots and queue isolation.
+
+        A contended job raises ``WatchError`` and is skipped for now; a later scheduler tick
+        revisits it, so a job reaches the waiting queue at most once. Other jobs in the same
+        batch are unaffected.
+
+        Args:
+            job_ids (list[str]): Job IDs read from the due portion of this registry.
+            queue (Queue): Queue to enqueue jobs onto (``job.origin`` is expected to match).
+            timestamp (Optional[float]): Cutoff used when re-checking scores. Defaults to now.
+
+        Returns:
+            list[Job]: The jobs that were enqueued by this call.
+        """
+        if not job_ids:
+            return []
+
+        cutoff = timestamp if timestamp is not None else current_timestamp()
+        fetched = self.job_class.fetch_many(job_ids, connection=self.connection, serializer=self.serializer)
+
+        enqueued: list[Job] = []
+        for job_id, job in zip(job_ids, fetched):
+            if job is None:
+                # The job record was deleted; the dangling registry entry is cleaned as before.
+                self.connection.zrem(self.key, job_id)
+                continue
+            # Cheap pre-checks avoid opening a watched transaction for entries already known to
+            # be stale. The authoritative re-checks happen under WATCH below.
+            if job.get_status(refresh=False) != JobStatus.SCHEDULED:
+                self.connection.zrem(self.key, job_id)
+                continue
+            # Another scheduler may have claimed (removed) the entry between the bulk fetch above
+            # and this read; then there is nothing left to transfer.
+            score = self.connection.zscore(self.key, job.id)
+            if score is None:
+                continue
+            if score > cutoff:
+                # Rescheduled to a later time; the job stays scheduled until that time arrives.
+                continue
+            try:
+                with self.connection.pipeline() as pipe:
+                    pipe.watch(self.key, job.key)
+
+                    # Claim check: this registry must still own the job id at a due score.
+                    score = cast('float | None', pipe.zscore(self.key, job.id))
+                    if score is None:
+                        pipe.unwatch()
+                        continue
+                    if score > cutoff:
+                        pipe.unwatch()
+                        continue
+
+                    status = cast('bytes | str | None', pipe.hget(job.key, 'status'))
+                    if not status or JobStatus(as_text(status)) != JobStatus.SCHEDULED:
+                        # Canceled, already enqueued by another scheduler, or otherwise moved on.
+                        pipe.multi()
+                        self.remove(job, pipeline=pipe)
+                        pipe.execute()
+                        continue
+
+                    pipe.multi()
+                    self.remove(job, pipeline=pipe)
+                    if job.has_rate_limit:
+                        queue._enqueue_rate_limited_job(job, pipeline=pipe, at_front=job.should_enqueue_at_front())
+                    else:
+                        queue._enqueue_job(job, pipeline=pipe, at_front=job.should_enqueue_at_front())
+                    pipe.execute()
+            except WatchError:
+                logger.info('Scheduled job %s changed while enqueueing; skipping for now', job_id)
+                continue
+            except Exception:
+                logger.exception('Failed to enqueue scheduled job %s; leaving in ScheduledJobRegistry', job_id)
+                continue
+            enqueued.append(job)
+        return enqueued
+
     def get_scheduled_time(self, job_or_id: Job | str) -> datetime:
         """Returns datetime (UTC) at which job is scheduled to be enqueued
 

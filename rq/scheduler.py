@@ -239,14 +239,18 @@ class RQScheduler:
         """Enqueue jobs whose timestamp is in the past"""
         self._status = self.Status.WORKING
 
-        if not self._scheduled_job_registries and self._acquired_locks:
+        if not self._scheduled_job_registries:
+            # Rebuild on every cold start. acquire_locks()/heartbeat() also reset the cache when
+            # lock ownership changes, so a fresh scheduler instance never works from registries
+            # read by a previous incarnation.
             self.prepare_registries()
 
         for registry in self._scheduled_job_registries:
             timestamp = current_timestamp()
 
-            # TODO: try to use Lua script to make get_jobs_to_schedule()
-            # and remove_jobs() atomic
+            # The read below is only a candidate list. Each transfer re-validates the job's
+            # status and score at transfer time, so stale reads (another scheduler, or a
+            # cancel/reschedule between read and transfer) never enqueue a job twice or early.
             job_ids = registry.get_jobs_to_schedule(timestamp)
 
             if not job_ids:
@@ -255,34 +259,7 @@ class RQScheduler:
             queue = self.queue_class(
                 registry.name, connection=self.connection, job_class=self.job_class, serializer=self.serializer
             )
-
-            jobs = self.job_class.fetch_many(job_ids, connection=self.connection, serializer=self.serializer)
-            normal_jobs = []
-            jobs_with_rate_limit = []
-            missing_job_ids = []
-
-            for job_id, job in zip(job_ids, jobs):
-                if job is None:
-                    missing_job_ids.append(job_id)
-                elif job.has_rate_limit:
-                    jobs_with_rate_limit.append(job)
-                else:
-                    normal_jobs.append(job)
-
-            if normal_jobs or missing_job_ids:
-                with self.connection.pipeline() as pipeline:
-                    for job in normal_jobs:
-                        queue._enqueue_job(job, pipeline=pipeline, at_front=job.should_enqueue_at_front())
-                        registry.remove(job.id, pipeline=pipeline)
-                    for job_id in missing_job_ids:
-                        registry.remove(job_id, pipeline=pipeline)
-                    pipeline.execute()
-
-            for job in jobs_with_rate_limit:
-                with self.connection.pipeline() as pipeline:
-                    registry.remove(job.id, pipeline=pipeline)
-                    queue._enqueue_rate_limited_job(job, pipeline=pipeline, at_front=job.should_enqueue_at_front())
-                    pipeline.execute()
+            registry.enqueue_jobs(job_ids, queue=queue, timestamp=timestamp)
         self._status = self.Status.STARTED
 
     def _install_signal_handlers(self):

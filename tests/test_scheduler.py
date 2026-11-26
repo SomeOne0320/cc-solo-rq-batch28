@@ -1,19 +1,23 @@
 import os
+import threading
 from datetime import datetime, timedelta, timezone
 from multiprocessing import Process
 from unittest import mock
 
 import pytest
 import redis
+from redis.client import Pipeline
+from redis.exceptions import WatchError
 
 from rq import Queue
 from rq.defaults import DEFAULT_MAINTENANCE_TASK_INTERVAL
 from rq.exceptions import NoSuchJobError, SchedulerNotFound
 from rq.job import Job, JobStatus, Retry
+from rq.rate_limit import RateLimit, RateLimitRegistry
 from rq.registry import FinishedJobRegistry, ScheduledJobRegistry
 from rq.scheduler import RQScheduler
 from rq.serializers import JSONSerializer
-from rq.utils import current_timestamp, utcformat
+from rq.utils import current_timestamp, now, utcformat
 from rq.worker import Worker
 from tests import RQTestCase, find_empty_redis_database, ssl_test, system_timezone
 
@@ -436,6 +440,7 @@ class TestScheduler(RQTestCase):
         registry = ScheduledJobRegistry(queue=queue)
         job = Job.create('myfunc', connection=self.connection)
         job.save()
+        job.set_status(JobStatus.SCHEDULED)
         registry.schedule(job, datetime(2019, 1, 1, tzinfo=timezone.utc))
         scheduler = RQScheduler([queue], connection=self.connection)
         scheduler.acquire_locks()
@@ -446,6 +451,7 @@ class TestScheduler(RQTestCase):
         self.assertEqual(len(registry), 0)
 
         # Jobs scheduled in the far future should not be affected
+        job.set_status(JobStatus.SCHEDULED)
         registry.schedule(job, datetime(2100, 1, 1, tzinfo=timezone.utc))
         scheduler.enqueue_scheduled_jobs()
         self.assertEqual(len(queue), 1)
@@ -463,6 +469,368 @@ class TestScheduler(RQTestCase):
             scheduler._scheduled_job_registries,
             [ScheduledJobRegistry(queue=foo_queue), ScheduledJobRegistry(queue=bar_queue)],
         )
+
+
+class TestScheduledJobRegistryEnqueue(RQTestCase):
+    """ScheduledJobRegistry.enqueue_jobs() must transfer jobs based on the status and score
+    valid at transfer time, never on a stale candidate list."""
+
+    def setUp(self):
+        super().setUp()
+        self.queue = Queue(connection=self.connection)
+        self.registry = ScheduledJobRegistry(queue=self.queue)
+        self.past = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+    def _schedule_due_job(self, job_id='due-job', **kwargs):
+        job = self.queue.enqueue_at(self.past, say_hello, job_id=job_id, **kwargs)
+        self.assertEqual(job.get_status(), JobStatus.SCHEDULED)
+        return job
+
+    def test_due_job_is_enqueued_and_removed(self):
+        """A still-valid due job is enqueued (QUEUED, at-front honored) and leaves the registry."""
+        sentinel = self.queue.enqueue(say_hello, job_id='sentinel')
+        job = self._schedule_due_job(job_id='front-job', at_front=True)
+
+        enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+
+        self.assertEqual(enqueued, [job])
+        self.assertNotIn(job.id, self.registry.get_job_ids(cleanup=False))
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.QUEUED)
+        self.assertEqual(self.queue.get_job_ids(), [job.id, sentinel.id])
+
+    def test_canceled_job_between_read_and_transfer_stays_canceled(self):
+        """A job canceled after the candidate read is not enqueued; its stale entry is dropped
+        and the CANCELED status (and CanceledJobRegistry membership) is preserved."""
+        from rq.registry import CanceledJobRegistry
+
+        job = self._schedule_due_job(job_id='canceled-midflight')
+        job_ids = self.registry.get_jobs_to_schedule()
+
+        # Operator cancels between the scheduler's read and its transfer.
+        job.cancel()
+        self.assertEqual(job.get_status(), JobStatus.CANCELED)
+
+        enqueued = self.registry.enqueue_jobs(job_ids, queue=self.queue)
+
+        self.assertEqual(enqueued, [])
+        self.assertEqual(self.queue.get_job_ids(), [])
+        self.assertNotIn(job.id, self.registry.get_job_ids(cleanup=False))
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.CANCELED)
+        self.assertIn(job.id, CanceledJobRegistry(queue=self.queue).get_job_ids())
+
+    def test_rescheduled_job_waits_for_new_time(self):
+        """A job pushed to a later score after the candidate read is not transferred early."""
+        job = self._schedule_due_job(job_id='rescheduled-midflight')
+        job_ids = self.registry.get_jobs_to_schedule()
+        new_time = now() + timedelta(hours=1)
+
+        self.queue.schedule_job(job, new_time)
+
+        enqueued = self.registry.enqueue_jobs(job_ids, queue=self.queue)
+
+        self.assertEqual(enqueued, [])
+        self.assertEqual(self.queue.get_job_ids(), [])
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.SCHEDULED)
+        # Both the entry and the new (future) score are untouched.
+        self.assertIn(job.id, self.registry.get_job_ids(cleanup=False))
+        self.assertGreater(self.connection.zscore(self.registry.key, job.id), current_timestamp())
+
+        # Once the new time arrives, the same job transfers normally.
+        self.registry.schedule(job, self.past)
+        enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+        self.assertEqual([j.id for j in enqueued], [job.id])
+        self.assertEqual(self.queue.get_job_ids(), [job.id])
+
+    def test_deleted_job_entry_is_cleaned_but_siblings_transfer(self):
+        """A dangling entry (job record deleted) is cleaned like before, without affecting the
+        other due jobs in the same batch."""
+        deleted = self._schedule_due_job(job_id='deleted-midflight')
+        survivor = self._schedule_due_job(job_id='survivor')
+        job_ids = self.registry.get_jobs_to_schedule()
+
+        deleted.delete()
+        self.assertFalse(self.connection.exists(Job.key_for(deleted.id)))
+
+        enqueued = self.registry.enqueue_jobs(job_ids, queue=self.queue)
+
+        self.assertEqual([j.id for j in enqueued], [survivor.id])
+        self.assertNotIn(deleted.id, self.registry.get_job_ids(cleanup=False))
+        self.assertNotIn(survivor.id, self.registry.get_job_ids(cleanup=False))
+        self.assertEqual(self.queue.get_job_ids(), [survivor.id])
+
+    def test_non_scheduled_status_entry_is_dropped_without_enqueue(self):
+        """An entry whose job's status is no longer SCHEDULED is dropped, never enqueued."""
+        job = self._schedule_due_job(job_id='status-changed')
+        # Simulate another scheduler having enqueued it already: QUEUED but entry still present.
+        job.set_status(JobStatus.QUEUED)
+
+        enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+
+        self.assertEqual(enqueued, [])
+        self.assertNotIn(job.id, self.registry.get_job_ids(cleanup=False))
+        # No duplicate push onto the queue.
+        self.assertEqual(self.queue.get_job_ids(), [])
+
+    def test_watcherror_means_job_enters_queue_at_most_once(self):
+        """If the watched keys change during transfer, EXEC aborts: nothing is enqueued and the
+        entry stays for the next tick."""
+        job = self._schedule_due_job(job_id='contended')
+
+        original_execute = Pipeline.execute
+
+        def fake_execute(self_pipe, *args, **kwargs):
+            if getattr(self_pipe, 'watching', False):
+                raise WatchError('simulated scheduler contention')
+            return original_execute(self_pipe, *args, **kwargs)
+
+        with mock.patch('redis.client.Pipeline.execute', fake_execute):
+            enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+
+        self.assertEqual(enqueued, [])
+        self.assertEqual(self.queue.get_job_ids().count(job.id), 0)
+        self.assertIn(job.id, self.registry.get_job_ids(cleanup=False))
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.SCHEDULED)
+
+        # The next uncontended tick transfers it exactly once.
+        enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+        self.assertEqual([j.id for j in enqueued], [job.id])
+        self.assertEqual(self.queue.get_job_ids(), [job.id])
+
+    def test_two_schedulers_same_batch_enqueue_each_job_once(self):
+        """Two schedulers acting on the same candidate IDs: the WATCH winner transfers the job,
+        the loser's transaction aborts and never pushes a second copy."""
+        job = self._schedule_due_job(job_id='double-scheduler')
+        job_ids = [job.id]
+        contender_ran = {'done': False}
+
+        original_execute = Pipeline.execute
+
+        def contender_execute(self_pipe, *args, **kwargs):
+            # Right when the loser's watched transaction reaches EXEC, another scheduler commits
+            # the same transfer first. The watched zset then changes, so Redis aborts this EXEC
+            # with WatchError — a genuine read/transfer interleaving, no faked exception.
+            if getattr(self_pipe, 'watching', False) and not contender_ran['done']:
+                contender_ran['done'] = True
+                winner = ScheduledJobRegistry(queue=self.queue)
+                winner.enqueue_jobs(list(job_ids), queue=self.queue)
+                self.assertEqual(self.queue.get_job_ids(), [job.id])
+            return original_execute(self_pipe, *args, **kwargs)
+
+        with mock.patch('redis.client.Pipeline.execute', contender_execute):
+            enqueued = self.registry.enqueue_jobs(job_ids, queue=self.queue)
+
+        self.assertEqual([j.id for j in enqueued], [])
+        self.assertEqual(self.queue.get_job_ids(), [job.id])
+        self.assertNotIn(job.id, self.registry.get_job_ids(cleanup=False))
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.QUEUED)
+
+    def test_cancel_observed_under_watch_drops_entry_inside_transaction(self):
+        """If the status flips to CANCELED while the transfer is being watched, the re-read inside
+        WATCH catches it and the entry is removed without enqueuing."""
+        job = self._schedule_due_job(job_id='canceled-under-watch')
+
+        original_hget = Pipeline.hget
+
+        def fake_hget(self_pipe, name, key):
+            if name == job.key and key == 'status':
+                return JobStatus.CANCELED.value.encode()
+            return original_hget(self_pipe, name, key)
+
+        with mock.patch('redis.client.Pipeline.hget', fake_hget):
+            enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+
+        self.assertEqual(enqueued, [])
+        self.assertEqual(self.queue.get_job_ids(), [])
+        self.assertNotIn(job.id, self.registry.get_job_ids(cleanup=False))
+
+    def test_later_score_observed_under_watch_skips_transfer(self):
+        """If the score moves to the future while the transfer is being watched, the watched
+        re-read skips the job and leaves the entry for the new due time."""
+        job = self._schedule_due_job(job_id='rescheduled-under-watch')
+
+        original_zscore = Pipeline.zscore
+
+        def fake_zscore(self_pipe, key, member):
+            if key == self.registry.key and member == job.id:
+                return current_timestamp() + 3600
+            return original_zscore(self_pipe, key, member)
+
+        with mock.patch('redis.client.Pipeline.zscore', fake_zscore):
+            enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+
+        self.assertEqual(enqueued, [])
+        self.assertEqual(self.queue.get_job_ids(), [])
+        self.assertIn(job.id, self.registry.get_job_ids(cleanup=False))
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.SCHEDULED)
+
+    def test_rate_limited_job_follows_same_contract(self):
+        """Due rate-limited jobs go through the rate limit path with the same transfer-time
+        guarantees; slots and waiting-set membership are preserved."""
+        rate_limit = RateLimit(key='scheduled-rl', concurrency=1)
+
+        # Capacity free: transferred once, holding a slot and sitting on the queue.
+        job = self._schedule_due_job(job_id='rl-due', rate_limit=rate_limit)
+        enqueued = self.registry.enqueue_jobs([job.id], queue=self.queue)
+        self.assertEqual([j.id for j in enqueued], [job.id])
+        rl_registry = RateLimitRegistry(key='scheduled-rl', connection=self.connection)
+        self.assertIn(job.id, rl_registry.get_allowed_job_ids())
+        self.assertEqual(self.queue.get_job_ids(), [job.id])
+        self.assertNotIn(job.id, self.registry.get_job_ids(cleanup=False))
+
+        # Capacity exhausted: a second due job lands in the rate_limited waiting set, not the queue.
+        waiting = self._schedule_due_job(job_id='rl-waiting', rate_limit=rate_limit)
+        enqueued = self.registry.enqueue_jobs([waiting.id], queue=self.queue)
+        self.assertEqual([j.id for j in enqueued], [waiting.id])
+        self.assertNotIn(waiting.id, self.queue.get_job_ids())
+        self.assertIn(waiting.id, rl_registry.get_rate_limited_job_ids())
+        self.assertEqual(Job.fetch(waiting.id, connection=self.connection).get_status(), JobStatus.RATE_LIMITED)
+        self.assertNotIn(waiting.id, self.registry.get_job_ids(cleanup=False))
+
+        # A canceled rate-limited due job is never added to the waiting set.
+        canceled = self._schedule_due_job(job_id='rl-canceled', rate_limit=rate_limit)
+        canceled.cancel()
+        enqueued = self.registry.enqueue_jobs([canceled.id], queue=self.queue)
+        self.assertEqual(enqueued, [])
+        self.assertNotIn(canceled.id, rl_registry.get_rate_limited_job_ids())
+
+    def test_concurrent_transfers_enqueue_each_job_once(self):
+        """Real parallel schedulers acting on the same candidate list: every job is enqueued
+        exactly once and no transfer raises on an entry claimed by another scheduler."""
+        job_count = 20
+        job_ids = [self._schedule_due_job(job_id=f'race-{i}').id for i in range(job_count)]
+        candidate = list(job_ids)  # every scheduler holds the same stale due list
+        enqueued_counts: list[int] = []
+        errors: list[Exception] = []
+
+        def run_scheduler() -> None:
+            registry = ScheduledJobRegistry(
+                self.queue.name,
+                connection=redis.Redis(db=self.connection.connection_pool.connection_kwargs['db']),
+            )
+            queue = Queue(
+                self.queue.name,
+                connection=redis.Redis(db=self.connection.connection_pool.connection_kwargs['db']),
+            )
+            try:
+                enqueued_counts.append(len(registry.enqueue_jobs(list(candidate), queue=queue)))
+            except Exception as exc:  # pragma: no cover - fails the test if a race escapes
+                errors.append(exc)
+
+        threads = [threading.Thread(target=run_scheduler) for _ in range(4)]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+
+        self.assertEqual(errors, [])
+        self.assertEqual(sum(enqueued_counts), job_count)
+        self.assertEqual(sorted(self.queue.get_job_ids()), sorted(job_ids))
+        self.assertEqual(len(set(self.queue.get_job_ids())), job_count)
+        self.assertEqual(self.registry.get_job_count(cleanup=False), 0)
+
+
+class TestSchedulerStaleListInterleaving(RQTestCase):
+    """End-to-end scheduler ticks must honor transfer-time state for normal and rate-limited
+    jobs, across queues."""
+
+    def _scheduler(self, queue):
+        # Locks carry a TTL and are otherwise still held by a previously built scheduler;
+        # release them so the new instance actually owns the queue and schedules it.
+        self.connection.delete(RQScheduler.get_locking_key(queue.name))
+        scheduler = RQScheduler([queue], connection=self.connection)
+        scheduler.acquire_locks()
+        return scheduler
+
+    def test_scheduler_skips_canceled_and_rescheduled_and_enqueues_rest(self):
+        """One tick over a stale due list: canceled stays canceled, rescheduled waits for its new
+        time, deleted entries are cleaned, and the remaining due jobs are enqueued."""
+        queue = Queue('stale-tick', connection=self.connection)
+        registry = ScheduledJobRegistry(queue=queue)
+        past = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+        good = queue.enqueue_at(past, say_hello, job_id='good')
+        canceled = queue.enqueue_at(past, say_hello, job_id='canceled')
+        rescheduled = queue.enqueue_at(past, say_hello, job_id='rescheduled')
+        deleted = queue.enqueue_at(past, say_hello, job_id='deleted')
+
+        # Take the candidate snapshot, then interleave operator actions before the tick transfers.
+        job_ids = registry.get_jobs_to_schedule()
+        self.assertEqual(set(job_ids), {'good', 'canceled', 'rescheduled', 'deleted'})
+
+        canceled.cancel()
+        queue.schedule_job(rescheduled, now() + timedelta(hours=2))
+        deleted.delete()
+
+        self._scheduler(queue).enqueue_scheduled_jobs()
+
+        self.assertEqual(queue.get_job_ids(), [good.id])
+        self.assertEqual(Job.fetch(good.id, connection=self.connection).get_status(), JobStatus.QUEUED)
+        self.assertEqual(Job.fetch(canceled.id, connection=self.connection).get_status(), JobStatus.CANCELED)
+        self.assertEqual(Job.fetch(rescheduled.id, connection=self.connection).get_status(), JobStatus.SCHEDULED)
+        self.assertIn(rescheduled.id, registry.get_job_ids(cleanup=False))
+        self.assertFalse(self.connection.exists(Job.key_for(deleted.id)))
+        self.assertNotIn(deleted.id, registry.get_job_ids(cleanup=False))
+
+        # The rescheduled job transfers when its new time arrives.
+        registry.schedule(rescheduled, past)
+        self._scheduler(queue).enqueue_scheduled_jobs()
+        self.assertEqual(set(queue.get_job_ids()), {good.id, rescheduled.id})
+
+    def test_scheduler_two_ticks_same_list_enqueue_each_job_once(self):
+        """Two schedulers holding the same due list can each run a tick, but every job reaches the
+        queue exactly once."""
+        queue = Queue('double-tick', connection=self.connection)
+        registry = ScheduledJobRegistry(queue=queue)
+        past = datetime(2019, 1, 1, tzinfo=timezone.utc)
+        jobs = [queue.enqueue_at(past, say_hello, job_id=f'job-{i}') for i in range(5)]
+
+        scheduler_a = self._scheduler(queue)
+        scheduler_b = self._scheduler(queue)
+        scheduler_a.enqueue_scheduled_jobs()
+        scheduler_b.enqueue_scheduled_jobs()
+
+        self.assertEqual(sorted(queue.get_job_ids()), sorted(job.id for job in jobs))
+        self.assertEqual(registry.get_job_count(cleanup=False), 0)
+
+    def test_scheduler_preserves_queue_isolation(self):
+        """Jobs due on different registries are pushed onto their own queues only."""
+        alpha = Queue('alpha', connection=self.connection)
+        beta = Queue('beta', connection=self.connection)
+        past = datetime(2019, 1, 1, tzinfo=timezone.utc)
+        job_a = alpha.enqueue_at(past, say_hello, job_id='a')
+        job_b = beta.enqueue_at(past, say_hello, job_id='b')
+
+        scheduler = RQScheduler([alpha, beta], connection=self.connection)
+        scheduler.acquire_locks()
+        scheduler.enqueue_scheduled_jobs()
+
+        self.assertEqual(alpha.get_job_ids(), [job_a.id])
+        self.assertEqual(beta.get_job_ids(), [job_b.id])
+        self.assertEqual(ScheduledJobRegistry(queue=alpha).get_job_count(cleanup=False), 0)
+        self.assertEqual(ScheduledJobRegistry(queue=beta).get_job_count(cleanup=False), 0)
+
+    def test_scheduler_rate_limited_canceled_job_never_waits_nor_queues(self):
+        """A rate-limited due job canceled before transfer keeps CANCELED and never reaches the
+        waiting set or the queue, while a sibling due job still transfers."""
+        queue = Queue('rl-stale-tick', connection=self.connection)
+        registry = ScheduledJobRegistry(queue=queue)
+        rate_limit = RateLimit(key='tick-rl', concurrency=1)
+        past = datetime(2019, 1, 1, tzinfo=timezone.utc)
+
+        sibling = queue.enqueue_at(past, say_hello, job_id='sibling', rate_limit=rate_limit)
+        canceled = queue.enqueue_at(past, say_hello, job_id='canceled-rl', rate_limit=rate_limit)
+
+        registry.get_jobs_to_schedule()  # stale snapshot
+        canceled.cancel()
+
+        self._scheduler(queue).enqueue_scheduled_jobs()
+
+        rl_registry = RateLimitRegistry(key='tick-rl', connection=self.connection)
+        self.assertEqual(queue.get_job_ids(), [sibling.id])
+        self.assertIn(sibling.id, rl_registry.get_allowed_job_ids())
+        self.assertNotIn(canceled.id, rl_registry.get_rate_limited_job_ids())
+        self.assertNotIn(canceled.id, registry.get_job_ids(cleanup=False))
+        self.assertEqual(Job.fetch(canceled.id, connection=self.connection).get_status(), JobStatus.CANCELED)
 
 
 class TestWorker(RQTestCase):
