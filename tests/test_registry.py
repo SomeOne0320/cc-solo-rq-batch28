@@ -4,6 +4,7 @@ from unittest import mock
 from unittest.mock import ANY
 
 import pytest
+from redis.client import Pipeline
 
 from rq.defaults import DEFAULT_FAILURE_TTL
 from rq.exceptions import AbandonedJobError, InvalidJobOperation
@@ -726,6 +727,85 @@ class TestFailedJobRegistry(RQTestCase):
         registry = FailedJobRegistry(connection=self.connection)
         with self.assertRaises(InvalidJobOperation):
             registry.requeue(job)
+
+    def test_requeue_at_front_and_back(self):
+        """Requeueing leaves the failed registry and honors the current front/back choice."""
+        queue = Queue(connection=self.connection)
+        job_a = queue.enqueue(div_by_zero)
+        job_b = queue.enqueue(div_by_zero)
+        Worker([queue], connection=self.connection).work(burst=True)
+
+        registry = FailedJobRegistry(connection=self.connection)
+        self.assertIn(job_a, registry)
+        self.assertIn(job_b, registry)
+
+        job_a.requeue()  # back of the queue
+        job_b.requeue(at_front=True)  # front of the queue
+
+        self.assertEqual(queue.get_job_ids(), [job_b.id, job_a.id])
+        self.assertEqual(registry.get_job_ids(cleanup=False), [])
+        self.assertEqual(Job.fetch(job_a.id, connection=self.connection).get_status(), JobStatus.QUEUED)
+        self.assertEqual(Job.fetch(job_b.id, connection=self.connection).get_status(), JobStatus.QUEUED)
+
+    def test_requeue_interrupted_before_write_keeps_job_requeueable(self):
+        """If the requeue write is interrupted, the job stays in the failed registry and
+        can be requeued again by the same ID — it is never lost from both places."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(div_by_zero)
+        Worker([queue], connection=self.connection).work(burst=True)
+
+        registry = FailedJobRegistry(connection=self.connection)
+        self.assertIn(job, registry)
+
+        # Simulate a connection dropping before the requeue transaction is written.
+        from redis.exceptions import ConnectionError
+
+        with mock.patch.object(Pipeline, 'execute', side_effect=ConnectionError('write interrupted')):
+            with self.assertRaises(ConnectionError):
+                registry.requeue(job.id)
+
+        # Nothing was committed: still failed, not queued, not duplicated.
+        self.assertIn(job.id, registry.get_job_ids(cleanup=False))
+        self.assertEqual(queue.get_job_ids(), [])
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.FAILED)
+
+        # The same ID can be requeued once the write succeeds.
+        requeued_job = registry.requeue(job.id)
+        self.assertNotIn(job.id, registry.get_job_ids(cleanup=False))
+        self.assertEqual(queue.get_job_ids(), [job.id])
+        self.assertEqual(requeued_job.id, job.id)
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.QUEUED)
+
+    def test_concurrent_requeue_only_one_wins(self):
+        """Two callers requeueing the same ID: one succeeds, the other sees the job gone.
+        The queue gets exactly one pending copy."""
+        queue = Queue(connection=self.connection)
+        job = queue.enqueue(div_by_zero)
+        Worker([queue], connection=self.connection).work(burst=True)
+
+        registry = FailedJobRegistry(connection=self.connection)
+        self.assertIn(job, registry)
+
+        original_execute = Pipeline.execute
+        competing_requeues = []
+
+        def fake_execute(pipe, *args, **kwargs):
+            # Let a competing requeue of the same ID win after this caller's WATCH but
+            # before its EXEC, reproducing the multi-client race.
+            if pipe.watching and not competing_requeues:
+                competing_requeues.append(True)
+                with mock.patch.object(Pipeline, 'execute', original_execute):
+                    FailedJobRegistry(connection=self.connection).requeue(job.id)
+            return original_execute(pipe, *args, **kwargs)
+
+        with mock.patch.object(Pipeline, 'execute', fake_execute):
+            with self.assertRaises(InvalidJobOperation):
+                registry.requeue(job.id)
+
+        self.assertEqual(len(competing_requeues), 1)
+        self.assertEqual(queue.get_job_ids(), [job.id])
+        self.assertEqual(registry.get_job_ids(cleanup=False), [])
+        self.assertEqual(Job.fetch(job.id, connection=self.connection).get_status(), JobStatus.QUEUED)
 
     def test_worker_handle_job_failure(self):
         """Failed jobs are added to FailedJobRegistry"""

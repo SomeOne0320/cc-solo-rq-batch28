@@ -219,21 +219,55 @@ class BaseRegistry:
             serializer = self.serializer
             job = self.job_class.fetch(job_or_id, connection=self.connection, serializer=serializer)
 
-        result = self.connection.zrem(self.key, job.id)
-        if not result:
-            raise InvalidJobOperation
-
         queue = Queue(job.origin, connection=self.connection, job_class=self.job_class, serializer=serializer)
         job.started_at = None
         job.ended_at = None
         job._exc_info = ''  # TODO: this should be removed
-        if job.has_rate_limit:
-            # Requeued jobs must reacquire capacity.
-            job.enqueue_at_front = at_front
-            return queue._enqueue_rate_limited_job(job)
+
+        # Removing the job from the failed registry and enqueueing it must be one atomic
+        # operation. If the registry entry were removed separately, an interruption before
+        # the enqueue write would drop the job from both the failed registry and the queue,
+        # leaving no way to requeue it again by ID. Watching the registry also makes two
+        # concurrent requeues of the same job conflict: only the first EXEC wins.
         with self.connection.pipeline() as pipeline:
-            job = queue._enqueue_job(job, pipeline=pipeline, at_front=at_front)
-            pipeline.execute()
+            while True:
+                try:
+                    pipeline.watch(self.key)
+                    if pipeline.zscore(self.key, job.id) is None:
+                        # Not in the registry (never was, or a concurrent requeue won the
+                        # race before we started watching): nothing to do.
+                        pipeline.unwatch()
+                        raise InvalidJobOperation
+
+                    pipeline.multi()
+                    pipeline.zrem(self.key, job.id)
+                    if job.has_rate_limit:
+                        # Requeued jobs must reacquire capacity. Until a slot frees up, the
+                        # job waits in the rate_limited state and is promoted by the limiter.
+                        job.enqueue_at_front = at_front
+                        queue._enqueue_rate_limited_job(job, pipeline=pipeline, at_front=at_front)
+                        # acquire_and_enqueue() is the last command queued by that call, so
+                        # its promoted-job list is the last result of the transaction.
+                        acquire_index: int | None = len(pipeline.command_stack) - 1
+                    else:
+                        job = queue._enqueue_job(job, pipeline=pipeline, at_front=at_front)
+                        acquire_index = None
+                    results = pipeline.execute()
+                    break
+                except WatchError:
+                    # The registry changed between the check and EXEC. Retry: if another
+                    # caller requeued this job, the entry is now gone and we raise
+                    # InvalidJobOperation above instead of enqueueing a second copy.
+                    pipeline.reset()
+                    continue
+
+        if acquire_index is not None:
+            promoted = {as_text(job_id) for job_id in cast(list, results[acquire_index])}
+            if job.id in promoted:
+                # _enqueue_rate_limited_job() can't know the script's outcome while the
+                # transaction is still buffered, so mirror the promotion on the job.
+                job._status = JobStatus.QUEUED
+                job.enqueued_at = now()
         return job
 
     @staticmethod

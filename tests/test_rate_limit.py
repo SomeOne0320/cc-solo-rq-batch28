@@ -775,6 +775,72 @@ class TestRateLimitEnqueue(RQTestCase):
         failed_job.requeue(at_front=True)
         self.assertEqual(self.queue.job_ids, [failed_job.id, plain_job.id])
 
+    def test_requeue_rate_limited_interrupted_keeps_job_requeueable(self):
+        """If a rate-limited requeue is interrupted before the write, the job stays in the
+        failed registry and can be requeued again by the same ID into the waiting state."""
+        rate_limit = RateLimit(key='test', concurrency=1)
+        registry = RateLimitRegistry(key='test', connection=self.connection)
+
+        failed_job = self.queue.enqueue(div_by_zero, 1, rate_limit=rate_limit)
+        SimpleWorker([self.queue], connection=self.connection).work(max_jobs=1)
+        self.assertEqual(failed_job.get_status(), JobStatus.FAILED)
+        blocking_job = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+
+        from redis.exceptions import ConnectionError
+
+        with mock.patch.object(Pipeline, 'execute', side_effect=ConnectionError('write interrupted')):
+            with self.assertRaises(ConnectionError):
+                failed_job.requeue()
+
+        # Nothing committed: still failed, not waiting for a slot, not on the queue.
+        self.assertIn(failed_job.id, self.queue.failed_job_registry.get_job_ids(cleanup=False))
+        self.assertNotIn(failed_job.id, registry.get_rate_limited_job_ids())
+        self.assertEqual(self.queue.job_ids, [blocking_job.id])
+        self.assertEqual(failed_job.get_status(), JobStatus.FAILED)
+
+        # The same ID can be requeued again and waits for a slot.
+        requeued_job = failed_job.requeue()
+        self.assertEqual(requeued_job.id, failed_job.id)
+        self.assertNotIn(failed_job.id, self.queue.failed_job_registry.get_job_ids(cleanup=False))
+        self.assertEqual(requeued_job.get_status(refresh=False), JobStatus.RATE_LIMITED)
+        self.assertIn(failed_job.id, registry.get_rate_limited_job_ids())
+        self.assertEqual(self.queue.job_ids, [blocking_job.id])
+
+        # Freeing the slot promotes the requeued job.
+        SimpleWorker([self.queue], connection=self.connection).work(max_jobs=1)
+        self.assertEqual(failed_job.get_status(), JobStatus.QUEUED)
+        self.assertEqual(self.queue.job_ids, [failed_job.id])
+
+    def test_concurrent_rate_limited_requeue_only_one_wins(self):
+        """Two requeues of the same rate-limited ID: only one takes effect, so the
+        rate_limited set holds a single entry."""
+        rate_limit = RateLimit(key='test', concurrency=1)
+        registry = RateLimitRegistry(key='test', connection=self.connection)
+
+        failed_job = self.queue.enqueue(div_by_zero, 1, rate_limit=rate_limit)
+        SimpleWorker([self.queue], connection=self.connection).work(max_jobs=1)
+        blocking_job = self.queue.enqueue(say_hello, rate_limit=rate_limit)
+
+        original_execute = Pipeline.execute
+        competing_requeues = []
+
+        def fake_execute(pipe, *args, **kwargs):
+            # A competing requeue wins after this caller's WATCH but before its EXEC.
+            if pipe.watching and not competing_requeues:
+                competing_requeues.append(True)
+                with mock.patch.object(Pipeline, 'execute', original_execute):
+                    failed_job.requeue()
+            return original_execute(pipe, *args, **kwargs)
+
+        with mock.patch.object(Pipeline, 'execute', fake_execute):
+            with self.assertRaises(InvalidJobOperation):
+                failed_job.requeue()
+
+        self.assertEqual(len(competing_requeues), 1)
+        self.assertEqual(registry.get_rate_limited_job_ids(), [failed_job.id])
+        self.assertEqual(self.queue.job_ids, [blocking_job.id])
+        self.assertEqual(Job.fetch(failed_job.id, connection=self.connection).get_status(), JobStatus.RATE_LIMITED)
+
     def test_cancel_removes_from_registry_and_promotes_rate_limited(self):
         """Canceling a rate_limited rate-limited job removes it (without promotion);
         canceling the allowed job frees its slot and promotes the next rate_limited job.
