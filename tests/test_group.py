@@ -7,7 +7,7 @@ import pytest
 from rq import Queue, SimpleWorker, Worker
 from rq.exceptions import NoSuchGroupError
 from rq.group import Group
-from rq.job import Job
+from rq.job import Job, JobStatus
 from rq.serializers import JSONSerializer
 from rq.utils import as_text
 from tests import RQTestCase
@@ -96,6 +96,96 @@ class TestGroup(RQTestCase):
         assert jobs[0].group_id == group.name
         fetched_job = Job.fetch(jobs[0].id, connection=self.connection)
         assert fetched_job.group_id == group.name
+
+    def test_group_enqueue_many_with_pipeline_is_invisible_until_commit(self):
+        """Group writes buffered on a caller pipeline are invisible to other connections."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+        other_connection = self.connection.__class__(connection_pool=self.connection.connection_pool)
+
+        with self.connection.pipeline() as pipe:
+            jobs = group.enqueue_many(q, [self.job_1_data, self.job_2_data], pipeline=pipe)
+            self.assertEqual(len(jobs), 2)
+            # Nothing is visible before the caller commits
+            self.assertFalse(other_connection.exists(group.key))
+            self.assertFalse(other_connection.exists(Group.REDIS_GROUP_KEY))
+            self.assertFalse(other_connection.exists(Job.key_for('job1')))
+            self.assertEqual(other_connection.llen(q.key), 0)
+            pipe.execute()
+
+        self.assertTrue(self.connection.exists(group.key))
+        self.assertIn(group.name.encode(), self.connection.smembers(Group.REDIS_GROUP_KEY))
+        self.assertEqual(q.job_ids, ['job1', 'job2'])
+        fetched_group = Group.fetch(group.name, connection=self.connection)
+        self.assertEqual({job.id for job in fetched_group.get_jobs()}, {'job1', 'job2'})
+        other_connection.close()
+
+    def test_group_enqueue_many_discarded_pipeline_leaves_no_residue(self):
+        """Discarding the caller pipeline leaves no queue, jobs or group records."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+
+        with self.connection.pipeline() as pipe:
+            group.enqueue_many(q, [self.job_1_data, self.job_2_data], pipeline=pipe)
+            pipe.reset()  # caller gives up the transaction
+
+        self.assertEqual(q.count, 0)
+        self.assertFalse(self.connection.exists(group.key))
+        self.assertEqual(self.connection.smembers(Group.REDIS_GROUP_KEY), set())
+        self.assertFalse(self.connection.exists(Job.key_for('job1')))
+        self.assertFalse(self.connection.exists(Job.key_for('job2')))
+        with self.assertRaises(NoSuchGroupError):
+            Group.fetch(group.name, connection=self.connection)
+
+    def test_group_enqueue_many_with_pipeline_and_dependencies(self):
+        """Group jobs inside a caller pipeline honor same-batch and external dependencies."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+        finished_parent = Job.create(func=say_hello, connection=self.connection)
+        finished_parent.save()
+        finished_parent.set_status(JobStatus.FINISHED)
+        finished_parent.save()
+
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='g-first'),
+            Queue.prepare_data(say_hello, job_id='g-second', depends_on='g-first'),
+            Queue.prepare_data(say_hello, job_id='g-third', depends_on=finished_parent),
+        ]
+        with self.connection.pipeline() as pipe:
+            jobs = group.enqueue_many(q, job_datas, pipeline=pipe)
+            pipe.execute()
+
+        by_id = {job.id: job for job in jobs}
+        self.assertEqual(by_id['g-first'].get_status(refresh=False), JobStatus.QUEUED)
+        self.assertEqual(by_id['g-second'].get_status(refresh=False), JobStatus.DEFERRED)
+        self.assertEqual(by_id['g-third'].get_status(refresh=False), JobStatus.QUEUED)
+        self.assertEqual(q.job_ids, ['g-first', 'g-third'])
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), ['g-second'])
+        # Every job, including the deferred one, is registered with the group
+        self.assertEqual(
+            {as_text(job_id) for job_id in self.connection.smembers(group.key)},
+            {'g-first', 'g-second', 'g-third'},
+        )
+
+    def test_group_enqueue_many_with_pipeline_worker_unlocks_chain(self):
+        """A worker unlocks grouped follow-up jobs registered through a caller pipeline."""
+        q = Queue(connection=self.connection)
+        group = Group.create(connection=self.connection)
+        worker = SimpleWorker([q], connection=self.connection)
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='g-chain-first'),
+            Queue.prepare_data(say_hello, job_id='g-chain-second', depends_on='g-chain-first'),
+        ]
+
+        with self.connection.pipeline() as pipe:
+            group.enqueue_many(q, job_datas, pipeline=pipe)
+            pipe.execute()
+
+        self.assertEqual(q.job_ids, ['g-chain-first'])
+        worker.work(burst=True)
+        self.assertEqual(Job.fetch('g-chain-first', connection=self.connection).get_status(), JobStatus.FINISHED)
+        self.assertEqual(Job.fetch('g-chain-second', connection=self.connection).get_status(), JobStatus.FINISHED)
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), [])
 
     def test_deleted_jobs_removed_from_group(self):
         q = Queue(connection=self.connection)

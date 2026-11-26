@@ -4,7 +4,7 @@ from unittest.mock import patch
 
 from rq import Queue, Retry
 from rq.exceptions import DuplicateJobError
-from rq.job import Job, JobStatus
+from rq.job import Dependency, Job, JobStatus
 from rq.registry import (
     CanceledJobRegistry,
     DeferredJobRegistry,
@@ -15,7 +15,7 @@ from rq.registry import (
 )
 from rq.results import Result
 from rq.serializers import JSONSerializer
-from rq.worker import Worker
+from rq.worker import SimpleWorker, Worker
 from tests import RQTestCase, min_redis_version
 from tests.fixtures import echo, say_hello
 
@@ -720,6 +720,209 @@ class TestQueue(RQTestCase):
         self.assertEqual(q.job_ids, [parent.id, 'independent'])
         self.assertEqual(Job.fetch('dependent', connection=self.connection).get_status(), JobStatus.DEFERRED)
         self.assertEqual(q.deferred_job_registry.get_job_ids(), ['dependent'])
+
+    def test_enqueue_many_with_pipeline_is_invisible_to_other_connections(self):
+        """A caller's pipeline is not executed: nothing is visible until the caller commits."""
+        q = Queue(connection=self.connection)
+        parent_job = Job.create(func=say_hello, connection=self.connection)
+        parent_job.save()
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='independent'),
+            Queue.prepare_data(say_hello, job_id='dependent', depends_on=parent_job),
+        ]
+
+        # A separate connection must see nothing while the transaction is open
+        other_client = self.connection.__class__(connection_pool=self.connection.connection_pool)
+        with self.connection.pipeline() as pipe:
+            jobs = q.enqueue_many(job_datas, pipeline=pipe)
+            self.assertEqual(len(jobs), 2)
+            # The only visible key is the pre-existing parent job; none of the
+            # batch's writes may leak before the caller commits.
+            self.assertEqual(other_client.dbsize(), 1)
+            self.assertTrue(other_client.exists(parent_job.key))
+            self.assertEqual(other_client.llen(q.key), 0)
+            self.assertFalse(other_client.exists(Job.key_for('independent')))
+            self.assertFalse(other_client.exists(Job.key_for('dependent')))
+            self.assertEqual(other_client.smembers(parent_job.dependents_key), set())
+            self.assertEqual(other_client.zcard(q.deferred_job_registry.key), 0)
+            pipe.execute()
+
+        # After commit, the independent job is queued and the dependent one is deferred
+        self.assertEqual(q.job_ids, ['independent'])
+        self.assertEqual(Job.fetch('independent', connection=self.connection).get_status(), JobStatus.QUEUED)
+        dependent = Job.fetch('dependent', connection=self.connection)
+        self.assertEqual(dependent.get_status(), JobStatus.DEFERRED)
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), ['dependent'])
+        self.assertEqual(
+            set(self.connection.smembers(parent_job.dependents_key)),
+            {b'dependent'},
+        )
+        self.assertEqual(
+            set(self.connection.smembers(dependent.dependencies_key)),
+            {parent_job.id.encode()},
+        )
+        other_client.close()
+
+    def test_enqueue_many_with_pipeline_discard_leaves_no_residue(self):
+        """Discarding a caller's pipeline rolls back queues, jobs, dependencies and registries."""
+        q = Queue(connection=self.connection)
+        parent_job = Job.create(func=say_hello, connection=self.connection)
+        parent_job.save()
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='independent'),
+            Queue.prepare_data(say_hello, job_id='dependent', depends_on=parent_job),
+            Queue.prepare_data(say_hello, job_id='met_dependent', depends_on=parent_job),
+        ]
+        # Make one dependency externally met so the met-dependency write path is covered
+        parent_job.set_status(JobStatus.FINISHED)
+        parent_job.save()
+
+        with self.connection.pipeline() as pipe:
+            q.enqueue_many(job_datas, pipeline=pipe)
+            pipe.reset()  # caller gives up, e.g. order validation failed
+
+        self.assertEqual(q.count, 0)
+        self.assertEqual(q.job_ids, [])
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), [])
+        for job_id in ('independent', 'dependent', 'met_dependent'):
+            self.assertFalse(self.connection.exists(Job.key_for(job_id)))
+            self.assertFalse(self.connection.exists(Job.key_for(job_id) + ':dependencies'))
+            self.assertFalse(self.connection.exists(Job.key_for(job_id) + ':dependents'))
+        self.assertEqual(self.connection.smembers(parent_job.dependents_key), set())
+        # The pre-existing parent job itself must survive the rollback
+        self.assertTrue(self.connection.exists(parent_job.key))
+        self.assertNotIn(q.name, [queue.name for queue in Queue.all(connection=self.connection)])
+
+    def test_enqueue_many_with_pipeline_treats_batch_jobs_as_unfinished_dependencies(self):
+        """Jobs depending on another job in the same uncommitted batch are deferred,
+        regardless of ordering, and registered at the correct waiting position."""
+        q = Queue(connection=self.connection)
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='first'),
+            Queue.prepare_data(say_hello, job_id='second', depends_on='first'),
+            Queue.prepare_data(say_hello, job_id='third', depends_on='second'),
+        ]
+
+        with self.connection.pipeline() as pipe:
+            jobs = q.enqueue_many(job_datas, pipeline=pipe)
+            pipe.execute()
+
+        self.assertEqual([job.id for job in jobs], ['first', 'second', 'third'])
+        first = Job.fetch('first', connection=self.connection)
+        second = Job.fetch('second', connection=self.connection)
+        third = Job.fetch('third', connection=self.connection)
+        self.assertEqual(first.get_status(), JobStatus.QUEUED)
+        self.assertEqual(second.get_status(), JobStatus.DEFERRED)
+        self.assertEqual(third.get_status(), JobStatus.DEFERRED)
+        self.assertEqual(q.job_ids, ['first'])
+        self.assertEqual(set(q.deferred_job_registry.get_job_ids()), {'second', 'third'})
+        self.assertEqual(set(self.connection.smembers(first.dependents_key)), {b'second'})
+        self.assertEqual(set(self.connection.smembers(second.dependents_key)), {b'third'})
+        self.assertEqual(set(self.connection.smembers(second.dependencies_key)), {b'first'})
+        self.assertEqual(set(self.connection.smembers(third.dependencies_key)), {b'second'})
+
+    def test_enqueue_many_with_pipeline_worker_unlocks_chain(self):
+        """End-to-end: a worker actually unlocks each follow-up job as its predecessor finishes."""
+        q = Queue(connection=self.connection)
+        worker = SimpleWorker([q], connection=self.connection)
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='chain-first'),
+            Queue.prepare_data(say_hello, job_id='chain-second', depends_on='chain-first'),
+            Queue.prepare_data(say_hello, job_id='chain-third', depends_on='chain-second'),
+        ]
+
+        with self.connection.pipeline() as pipe:
+            q.enqueue_many(job_datas, pipeline=pipe)
+            pipe.execute()
+
+        # Only the head of the chain is runnable before anything runs
+        self.assertEqual(q.job_ids, ['chain-first'])
+        worker.work(burst=True)
+
+        for job_id in ('chain-first', 'chain-second', 'chain-third'):
+            self.assertEqual(
+                Job.fetch(job_id, connection=self.connection).get_status(),
+                JobStatus.FINISHED,
+                f'{job_id} should have been unlocked and finished by the worker',
+            )
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), [])
+
+    def test_enqueue_many_with_pipeline_external_met_dependency_is_enqueued(self):
+        """External dependencies that are already FINISHED follow the existing rules:
+        such jobs are enqueued straight away even inside a caller's pipeline."""
+        q = Queue(connection=self.connection)
+        finished_parent = Job.create(func=say_hello, connection=self.connection)
+        finished_parent.save()
+        finished_parent.set_status(JobStatus.FINISHED)
+        finished_parent.save()
+        unfinished_parent = Job.create(func=say_hello, connection=self.connection)
+        unfinished_parent.save()
+
+        with self.connection.pipeline() as pipe:
+            jobs = q.enqueue_many(
+                [
+                    Queue.prepare_data(say_hello, job_id='after-finished', depends_on=finished_parent),
+                    Queue.prepare_data(say_hello, job_id='after-unfinished', depends_on=unfinished_parent),
+                ],
+                pipeline=pipe,
+            )
+            pipe.execute()
+
+        by_id = {job.id: job for job in jobs}
+        self.assertEqual(by_id['after-finished'].get_status(refresh=False), JobStatus.QUEUED)
+        self.assertEqual(by_id['after-unfinished'].get_status(refresh=False), JobStatus.DEFERRED)
+        self.assertEqual(q.job_ids, ['after-finished'])
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), ['after-unfinished'])
+
+    def test_enqueue_many_with_pipeline_external_failed_dependency_rules(self):
+        """Existing failure rules apply inside a caller pipeline too: a missing
+        dependency counts as met, and FAILED is met only with allow_dependency_failures."""
+        q = Queue(connection=self.connection)
+        failed_parent = Job.create(func=say_hello, connection=self.connection)
+        failed_parent.save()
+        failed_parent.set_status(JobStatus.FAILED)
+        failed_parent.save()
+
+        with self.connection.pipeline() as pipe:
+            jobs = q.enqueue_many(
+                [
+                    Queue.prepare_data(
+                        say_hello,
+                        job_id='allow-failure',
+                        depends_on=Dependency([failed_parent], allow_failure=True),
+                    ),
+                    Queue.prepare_data(say_hello, job_id='strict', depends_on=failed_parent),
+                    Queue.prepare_data(say_hello, job_id='vanished', depends_on='no-such-job'),
+                ],
+                pipeline=pipe,
+            )
+            pipe.execute()
+
+        by_id = {job.id: job for job in jobs}
+        self.assertEqual(by_id['allow-failure'].get_status(refresh=False), JobStatus.QUEUED)
+        self.assertEqual(by_id['strict'].get_status(refresh=False), JobStatus.DEFERRED)
+        self.assertEqual(by_id['vanished'].get_status(refresh=False), JobStatus.QUEUED)
+        self.assertEqual(q.job_ids, ['allow-failure', 'vanished'])
+        self.assertEqual(q.deferred_job_registry.get_job_ids(), ['strict'])
+
+    def test_enqueue_many_with_pipeline_preserves_order_and_at_front(self):
+        """Generator input, job ordering and at_front keep working with a passed pipeline."""
+        q = Queue(connection=self.connection)
+        job_datas = [
+            Queue.prepare_data(say_hello, job_id='p-job-1', at_front=False),
+            Queue.prepare_data(say_hello, job_id='p-job-2', at_front=False),
+            Queue.prepare_data(say_hello, job_id='p-job-3', at_front=True),
+        ]
+
+        def data_generator():
+            yield from job_datas
+
+        with self.connection.pipeline() as pipe:
+            jobs = q.enqueue_many(data_generator(), pipeline=pipe)
+            self.assertEqual([job.id for job in jobs], ['p-job-1', 'p-job-2', 'p-job-3'])
+            pipe.execute()
+
+        self.assertEqual(q.job_ids, ['p-job-3', 'p-job-1', 'p-job-2'])
 
     def test_enqueue_different_queues_with_passed_pipeline(self):
         """Jobs should be enqueued into different queues in a provided pipeline"""

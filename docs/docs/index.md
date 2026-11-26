@@ -135,8 +135,16 @@ with q.connection.pipeline() as pipe:
     ],
     pipeline=pipe
   )
+  # Nothing is written to Redis yet: another connection cannot see these jobs.
+  # Validate your order here and either commit ...
   pipe.execute()
+  # ... or discard the pipeline; no queue entries, jobs or dependency records remain.
 ```
+
+When you pass in a pipeline, `enqueue_many()` only buffers the job writes and leaves
+the transaction to you. Jobs that depend on another job in the same batch are always
+deferred until that predecessor finishes. Without a pipeline, the enqueue is committed
+before the method returns.
 
 `Queue.prepare_data` accepts all arguments that `Queue.parse_args` does.
 
@@ -161,6 +169,21 @@ jobs = group.enqueue_many(
     Queue.prepare_data(count_words_at_url, ('http://nvie.com',), job_id='my_other_job_id'),
   ]
 )
+```
+
+As with `queue.enqueue_many()`, you can pass your own pipeline so the jobs and the
+group registration share one transaction. The writes stay invisible until you call
+`pipe.execute()`; discarding the pipeline leaves no jobs, queue entries or group
+records behind.
+
+```python
+with redis_conn.pipeline() as pipe:
+  jobs = group.enqueue_many(
+    queue=q,
+    job_datas=[...],
+    pipeline=pipe
+  )
+  pipe.execute()
 ```
 
 You can then access jobs by calling the group's `get_jobs()` method:

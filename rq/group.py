@@ -32,10 +32,13 @@ class Group:
         return f'Group(id={self.name})'
 
     def _add_jobs(self, jobs: Iterable[Job], pipeline: Pipeline):
-        """Add jobs to the group"""
+        """Add jobs to the group.
+
+        Writes are only buffered on ``pipeline``; executing (or discarding) the
+        transaction is the caller's responsibility.
+        """
         pipeline.sadd(self.key, *[job.id for job in jobs])
         pipeline.sadd(self.REDIS_GROUP_KEY, self.name)
-        pipeline.execute()
 
     def cleanup(self):
         """Delete jobs from the group's job registry that have been deleted or expired from Redis.
@@ -46,6 +49,13 @@ class Group:
             self.connection.srem(self.key, *expired_job_ids)
 
     def enqueue_many(self, queue: Queue, job_datas: Iterable[EnqueueData], pipeline: Pipeline | None = None):
+        """Enqueue multiple jobs and register them in this group.
+
+        When ``pipeline`` is provided, the job writes and the group registration
+        are buffered on it and nothing is executed: the caller owns the
+        transaction and must ``execute()`` it (or discard it) itself. Without a
+        pipeline, everything is enqueued and registered before this method returns.
+        """
         pipe = pipeline if pipeline else self.connection.pipeline()
 
         jobs = queue.enqueue_many(job_datas, group_id=self.name, pipeline=pipe)

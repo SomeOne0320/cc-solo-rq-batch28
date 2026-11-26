@@ -1,3 +1,8 @@
+### RQ 3.0.1 (unreleased)
+
+Bug Fixes:
+* `Queue.enqueue_many()` and `Group.enqueue_many()` no longer execute a pipeline passed in by the caller. All writes are now buffered on the caller's transaction, so they stay invisible to other connections until the caller commits and leave no residue if the pipeline is discarded. Jobs depending on other jobs in the same batch are now always deferred instead of reading uncommitted state.
+
 ### RQ 3.0 (2026-10-28)
 
 New Features:

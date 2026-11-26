@@ -892,17 +892,23 @@ class Queue:
         """Creates multiple jobs (created via `Queue.prepare_data` calls)
         to represent the delayed function calls and enqueues them.
 
+        When ``pipeline`` is provided, every write (job hashes, queue entries,
+        dependency bookkeeping and registry membership) is buffered on that
+        pipeline and nothing is executed: the caller owns the transaction and
+        is responsible for ``execute()`` or discarding it. Reads needed to
+        decide which jobs are deferred run on a separate connection, so
+        uncommitted state can never leak and a discarded pipeline leaves no
+        residue. Jobs created by this same call are always treated as
+        unfinished dependencies, regardless of their position in the batch.
+
         Args:
             job_datas (Iterable[EnqueueData]): An iterable of job data
             pipeline (Optional[Pipeline], optional): The Redis Pipeline. Defaults to None.
+            group_id (Optional[str], optional): ID of the group the jobs belong to. Defaults to None.
 
         Returns:
-            List[Job]: A list of enqueued jobs
+            List[Job]: The jobs, in the order they were provided
         """
-
-        jobs_without_dependencies = []
-        jobs_with_unmet_dependencies = []
-        jobs_with_met_dependencies = []
 
         def get_job_kwargs(job_data, initial_status):
             return {
@@ -942,7 +948,22 @@ class Queue:
             else:
                 job_datas_without_dependencies.append(job_data)
 
-        pipe = pipeline if pipeline is not None else self.connection.pipeline()
+        if pipeline is not None:
+            return self._enqueue_many_with_pipeline(
+                job_datas_without_dependencies, job_datas_with_dependencies, pipeline, get_job_kwargs
+            )
+        return self._enqueue_many_with_internal_pipeline(
+            job_datas_without_dependencies, job_datas_with_dependencies, get_job_kwargs
+        )
+
+    def _enqueue_many_with_internal_pipeline(
+        self, job_datas_without_dependencies, job_datas_with_dependencies, get_job_kwargs
+    ) -> list[Job]:
+        """enqueue_many() path that owns its own pipeline and runs its own transactions."""
+        jobs_without_dependencies = []
+        jobs_with_unmet_dependencies = []
+        jobs_with_met_dependencies = []
+        pipe = self.connection.pipeline()
 
         # Add Queue key set
         pipe.sadd(self.redis_queues_keys, self.key)
@@ -957,8 +978,7 @@ class Queue:
                 )
                 for job_data in job_datas_without_dependencies
             ]
-            if pipeline is None:
-                pipe.execute()
+            pipe.execute()
 
         if job_datas_with_dependencies:
             # Save all jobs with dependencies as deferred
@@ -968,8 +988,7 @@ class Queue:
             ]
             for job in jobs_with_dependencies:
                 job.save(pipeline=pipe)
-            if pipeline is None:
-                pipe.execute()
+            pipe.execute()
 
             # Enqueue the jobs whose dependencies have been met
             at_front_job_ids = {
@@ -987,10 +1006,102 @@ class Queue:
             # As in setup_dependencies(), deferred jobs expire after their ttl
             for job in jobs_with_unmet_dependencies:
                 job.cleanup(ttl=job.ttl, pipeline=pipe)
-            if pipeline is None:
-                pipe.execute()
+            pipe.execute()
 
         return jobs_without_dependencies + jobs_with_unmet_dependencies + jobs_with_met_dependencies
+
+    def _enqueue_many_with_pipeline(
+        self, job_datas_without_dependencies, job_datas_with_dependencies, pipeline: Pipeline, get_job_kwargs
+    ) -> list[Job]:
+        """enqueue_many() path for a caller-owned pipeline.
+
+        All writes are buffered on ``pipeline`` and never executed here. Dependency
+        checks read committed state through the queue's own connection rather than
+        through the caller's pipeline, so they cannot see this batch's uncommitted
+        jobs; every job created by this call is therefore treated as an unfinished
+        dependency.
+        """
+        jobs_without_dependencies = []
+        jobs_with_unmet_dependencies = []
+        jobs_with_met_dependencies = []
+
+        # Add Queue key set
+        pipeline.sadd(self.redis_queues_keys, self.key)
+
+        # Enqueue jobs without dependencies
+        if job_datas_without_dependencies:
+            jobs_without_dependencies = [
+                self._enqueue_job(
+                    self.create_job(**get_job_kwargs(job_data, JobStatus.QUEUED)),
+                    pipeline=pipeline,
+                    at_front=job_data.at_front,
+                )
+                for job_data in job_datas_without_dependencies
+            ]
+
+        if job_datas_with_dependencies:
+            # Save all jobs with dependencies as deferred
+            jobs_with_dependencies = [
+                self.create_job(**get_job_kwargs(job_data, JobStatus.DEFERRED))
+                for job_data in job_datas_with_dependencies
+            ]
+            for job in jobs_with_dependencies:
+                job.save(pipeline=pipeline)
+
+            # Jobs created by this same batch are not committed yet, so they are
+            # always unfinished dependencies. Only external (already committed)
+            # dependencies can be met. The checks read on a separate connection,
+            # leaving the caller's pipeline untouched.
+            batch_job_ids = {job.id for job in jobs_with_dependencies}
+            batch_job_ids.update(job.id for job in jobs_without_dependencies)
+            for job in jobs_with_dependencies:
+                external_dependency_ids = [
+                    dependency_id for dependency_id in job._dependency_ids if dependency_id not in batch_job_ids
+                ]
+                if self._external_dependencies_are_met(job, external_dependency_ids):
+                    jobs_with_met_dependencies.append(job)
+                else:
+                    jobs_with_unmet_dependencies.append(job)
+
+            at_front_job_ids = {
+                job.id
+                for job, job_data in zip(jobs_with_dependencies, job_datas_with_dependencies)
+                if job_data.at_front
+            }
+
+            # Register every job's dependency bookkeeping first (deferred registry plus
+            # each dependency's dependents set), mirroring the internal pipeline path.
+            # Met jobs are then removed from the deferred registry and pushed onto the
+            # queue; unmet jobs stay deferred and, as in setup_dependencies(), expire
+            # after their ttl.
+            for job in jobs_with_dependencies:
+                job.register_dependency(pipeline=pipeline)
+            for job in jobs_with_unmet_dependencies:
+                job.cleanup(ttl=job.ttl, pipeline=pipeline)
+            for job in jobs_with_met_dependencies:
+                self._enqueue_job(job, pipeline=pipeline, at_front=job.enqueue_at_front or job.id in at_front_job_ids)
+
+        return jobs_without_dependencies + jobs_with_unmet_dependencies + jobs_with_met_dependencies
+
+    def _external_dependencies_are_met(self, job: Job, external_dependency_ids: list[str]) -> bool:
+        """Whether all already-committed dependencies of ``job`` are in a met status.
+
+        Reads run on the queue's connection rather than on a caller-owned pipeline,
+        so this never executes or mutates an in-flight transaction. As in
+        ``Job.dependencies_are_met()``, a dependency that no longer exists counts as
+        met and ``allow_dependency_failures`` also treats ``FAILED`` as met.
+        """
+        if not external_dependency_ids:
+            # Every dependency is part of the same, still uncommitted batch.
+            return False
+        met_statuses = [JobStatus.FINISHED]
+        if job.allow_dependency_failures:
+            met_statuses.append(JobStatus.FAILED)
+        with self.connection.pipeline(transaction=False) as read_pipe:
+            for dependency_id in external_dependency_ids:
+                read_pipe.hget(job.key_for(dependency_id), 'status')
+            statuses = read_pipe.execute()
+        return all(status is None or status.decode() in met_statuses for status in statuses)
 
     def run_job(self, job: Job) -> Job:
         """Run the job
